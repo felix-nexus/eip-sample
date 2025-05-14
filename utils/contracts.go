@@ -12,17 +12,34 @@ import (
 
 func DeployMockERC20(t *testing.T, backend *Backend, auth *bind.TransactOpts, name, symbol string, decimals uint8) (common.Address, *binding.MockERC20, *bind.BoundContract) {
 	ctx := context.Background()
-	erc20Bin := common.Hex2Bytes(strings.TrimPrefix(binding.MockERC20MetaData.Bin, "0x"))
+	bin := common.Hex2Bytes(strings.TrimPrefix(binding.MockERC20MetaData.Bin, "0x"))
 
-	erc20ABI := binding.NewMockERC20()
-	erc20Address, tx, err := bind.DeployContract(auth, erc20Bin, backend.Client(), erc20ABI.PackConstructor(name, symbol, decimals))
+	ABI := binding.NewMockERC20()
+	addr, tx, err := bind.DeployContract(auth, bin, backend.Client(), ABI.PackConstructor(name, symbol, decimals))
 	require.NoError(t, err)
 	backend.Commit()
 
 	address, err := bind.WaitDeployed(ctx, backend.Client(), tx.Hash())
 	require.NoError(t, err)
-	require.Equal(t, erc20Address, address)
+	require.Equal(t, addr, address)
 
 	require.NoError(t, err)
-	return erc20Address, erc20ABI, erc20ABI.Instance(backend.Client(), address)
+	return addr, ABI, ABI.Instance(backend.Client(), address)
+}
+
+func DeployCounter(t *testing.T, backend *Backend, auth *bind.TransactOpts) (common.Address, *binding.Counter, *bind.BoundContract) {
+	ctx := context.Background()
+	bin := common.Hex2Bytes(strings.TrimPrefix(binding.CounterMetaData.Bin, "0x"))
+
+	ABI := binding.NewCounter()
+	addr, tx, err := bind.DeployContract(auth, bin, backend.Client(), []byte{})
+	require.NoError(t, err)
+	backend.Commit()
+
+	address, err := bind.WaitDeployed(ctx, backend.Client(), tx.Hash())
+	require.NoError(t, err)
+	require.Equal(t, addr, address)
+
+	require.NoError(t, err)
+	return addr, ABI, ABI.Instance(backend.Client(), address)
 }

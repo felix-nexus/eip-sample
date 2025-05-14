@@ -1,3 +1,5 @@
 contracts/dependencies
 contracts/out
 contracts/cache
+.idea
+eip-sample/.idea
