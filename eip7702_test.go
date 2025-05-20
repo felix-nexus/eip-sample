@@ -2,16 +2,20 @@ package eip_sample
 
 import (
 	"context"
+	"github.com/ethereum/go-ethereum/common/math"
+	"github.com/pkg/errors"
+	"math/big"
+	"testing"
+
 	"github.com/ethereum/go-ethereum/accounts/abi/bind/v2"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/params"
 	binding "github.com/felix-nexus/eip-sample/contracts/binding/go/src"
 	"github.com/felix-nexus/eip-sample/utils"
 	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
-	"math/big"
-	"testing"
 )
 
 // https://eips.ethereum.org/EIPS/eip-7702
@@ -752,4 +756,259 @@ func TestEIP7702MultiContracts(t *testing.T) {
 	count, err = counterABI.UnpackNumber(bytes)
 	require.NoError(t, err)
 	require.Equal(t, big.NewInt(33), count)
+}
+
+func TestEIP7702DelegateTxFee(t *testing.T) {
+	backend := utils.NewBackend(t)
+	require.NotNil(t, backend)
+	chainId, err := backend.Client().ChainID(ctx)
+	require.NoError(t, err)
+
+	// Counter, ERC20 컨트랙트 배포
+	counterAddress, counterABI, counter := utils.DeployCounter(t, backend, backend.Owner())
+	erc20Address, erc20ABI, erc20 := utils.DeployMockERC20(t, backend, backend.Owner(), "MockERC20", "MERC", 18)
+
+	// EntryPoint 컨트랙트 확인
+	entryPointAddress, entryPointABI, entryPoint := utils.EntryPoint(backend)
+	code, err := backend.Client().PendingCodeAt(ctx, entryPointAddress)
+	require.NoError(t, err)
+	require.NotEmpty(t, code)
+
+	// ERC20Paymaster 컨트랙트 배포
+	gasPrice, err := backend.Client().SuggestGasPrice(ctx)
+	require.NoError(t, err)
+	erc20PaymasterABI := binding.NewERC20Paymaster()
+	erc20PaymasterAddress, tx, err := bind.DeployContract(
+		backend.Owner(),
+		common.Hex2Bytes(binding.ERC20PaymasterMetaData.Bin[2:]),
+		backend.Client(),
+		erc20PaymasterABI.PackConstructor(
+			entryPointAddress,
+			erc20Address,
+			gasPrice,
+		),
+	)
+	require.NoError(t, err)
+	backend.Commit()
+	receipt, err := backend.Client().TransactionReceipt(ctx, tx.Hash())
+	require.NoError(t, err)
+	require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+	t.Run("deposit to erc20Paymaster", func(t *testing.T) {
+		txOpts := backend.Owner()
+		txOpts.Value = new(big.Int).Mul(common.Big256, big.NewInt(params.Ether))
+		tx, err = erc20PaymasterABI.Instance(backend.Client(), erc20PaymasterAddress).RawTransact(txOpts, erc20PaymasterABI.PackDeposit())
+		require.NoError(t, err)
+		backend.Commit()
+		receipt, err = backend.Client().TransactionReceipt(ctx, tx.Hash())
+		require.NoError(t, err)
+		require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+		txOpts.Value = nil
+
+		// erc20Paymaster 컨트랙트에 입금하면 erc20Paymaster 는 entryPoint 에 deposit 한다.
+		balance, err := backend.Client().PendingBalanceAt(ctx, erc20PaymasterAddress)
+		require.NoError(t, err)
+		require.True(t, balance.Sign() == 0)
+
+		balance, err = backend.Client().PendingBalanceAt(ctx, entryPointAddress)
+		require.NoError(t, err)
+		require.Equal(t, new(big.Int).Mul(common.Big256, big.NewInt(params.Ether)), balance)
+	})
+
+	// simple7702Account 컨트랙트 배포
+	simple7702AccountABI := binding.NewSimple7702Account()
+	simple7702AccountAddress, tx, err := bind.DeployContract(backend.Owner(), common.Hex2Bytes(binding.Simple7702AccountMetaData.Bin[2:]), backend.Client(), []byte{})
+	require.NoError(t, err)
+	backend.Commit()
+	receipt, err = backend.Client().TransactionReceipt(ctx, tx.Hash())
+	require.NoError(t, err)
+	require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+	simple7702Account := simple7702AccountABI.Instance(backend.Client(), simple7702AccountAddress)
+
+	// simple7702Account 컨트랙트 배포 확인
+	bytes, err := simple7702Account.CallRaw(callOpts, simple7702AccountABI.PackEntryPoint())
+	require.NoError(t, err)
+	callEntryPointAddress, err := simple7702AccountABI.UnpackEntryPoint(bytes)
+	require.NoError(t, err)
+	require.Equal(t, entryPointAddress, callEntryPointAddress)
+
+	// 테스트 계정 생성
+	eoa := backend.GetEoas(t, 1)[0]
+	prv := utils.GetPrivateKey(t, eoa.From)
+	// 테스트 계정은 Simple7702Account 코드를 등록 해야 한다. (이때 gas 비용이 발생한다.)
+	t.Run("SetCodeTx", func(t *testing.T) {
+		balance, err := backend.Client().PendingBalanceAt(ctx, eoa.From)
+		require.NoError(t, err)
+		nonce, err := backend.Client().PendingNonceAt(ctx, eoa.From)
+		require.NoError(t, err)
+		auth, err := types.SignSetCode(prv, types.SetCodeAuthorization{
+			ChainID: *uint256.MustFromBig(chainId), // 체인 ID
+			Address: simple7702AccountAddress,      // Code가 있는 컨트랙트 주소
+			Nonce:   nonce + 1,                     // Tx Nonce + 1
+		})
+		require.NoError(t, err)
+		tx, err = types.SignNewTx(prv, types.NewPragueSigner(chainId), &types.SetCodeTx{
+			ChainID:   uint256.MustFromBig(chainId),
+			Nonce:     nonce,
+			GasTipCap: uint256.MustFromBig(big.NewInt(1e9)),
+			GasFeeCap: uint256.MustFromBig(new(big.Int).Add(big.NewInt(1e9), big.NewInt(2e9))),
+			Gas:       1e6,
+			To:        eoa.From, // 반드시 본인의 EOA 주소여야 한다.
+			Value:     uint256.NewInt(0),
+			Data:      simple7702AccountABI.PackExecute(erc20Address, common.Big0, erc20ABI.PackApprove(erc20PaymasterAddress, math.MaxBig256)),
+			AuthList:  []types.SetCodeAuthorization{auth},
+		})
+		require.NoError(t, err)
+		require.NoError(t, backend.Client().SendTransaction(ctx, tx))
+		backend.Commit()
+		receipt, err = backend.Client().TransactionReceipt(ctx, tx.Hash())
+		require.NoError(t, err)
+		require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+		afterBalance, err := backend.Client().PendingBalanceAt(ctx, eoa.From)
+		require.NoError(t, err)
+		require.True(t, balance.Cmp(afterBalance) > 0)
+	})
+
+	// erc20 토큰 민팅
+	t.Run("Mint to EOA", func(t *testing.T) {
+		tx, err = erc20.RawTransact(backend.Owner(), erc20ABI.PackMint(eoa.From, new(big.Int).Mul(common.Big256, big.NewInt(params.Ether))))
+		require.NoError(t, err)
+		backend.Commit()
+		receipt, err = backend.Client().TransactionReceipt(ctx, tx.Hash())
+		require.NoError(t, err)
+		require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+		bytes, err = erc20.CallRaw(callOpts, erc20ABI.PackBalanceOf(eoa.From))
+		require.NoError(t, err)
+		balance, err := erc20ABI.UnpackBalanceOf(bytes)
+		require.NoError(t, err)
+		require.Equal(t, new(big.Int).Mul(common.Big256, big.NewInt(params.Ether)), balance)
+	})
+	t.Run("Make & Send UserOperation", func(t *testing.T) {
+		var (
+			opNonce *big.Int
+			gasfee  [32]byte
+		)
+		bytes, err = entryPoint.CallRaw(callOpts, entryPointABI.PackGetNonce(eoa.From, common.Big0))
+		require.NoError(t, err)
+		opNonce, err = entryPointABI.UnpackGetNonce(bytes)
+		require.NoError(t, err)
+
+		gasfee, err = utils.MakeGasFees(ctx, backend.Client())
+		require.NoError(t, err)
+
+		var userOp binding.PackedUserOperation
+		userOp, err = utils.SignPackedUserOperation(callOpts, entryPointABI, entryPoint, binding.PackedUserOperation{
+			Sender:   eoa.From,
+			Nonce:    opNonce,
+			InitCode: []byte{},
+			// Calldata
+			// Simple7702Account 의 execute 함수에 전달할 calldata
+			// function execute(address target, uint256 value, bytes calldata data) virtual external
+			CallData: simple7702AccountABI.PackExecute(counterAddress, common.Big0, counterABI.PackIncrement()),
+			// AccountGasLimits
+			// abi.encodePacked(uint128(verificationGasLimit), uint128(callGasLimit))
+			AccountGasLimits:   utils.MergeGasToBytes32(big.NewInt(1e6), big.NewInt(1e6)), // verificationGasLimit, callGasLimit
+			PreVerificationGas: big.NewInt(1e6),
+			// GasFees
+			// abi.encodePacked(uint128(maxPriorityFeePerGas), uint128(maxFeePerGas))
+			GasFees:          gasfee,
+			PaymasterAndData: utils.MakePaymasterData(erc20PaymasterAddress, 1e6, 1e6),
+			Signature:        []byte{},
+		}, prv)
+		require.NoError(t, err)
+
+		// erc20PaymasterBalance 는 현재 erc20 을 들고있지 않다.
+		var erc20PaymasterBalance *big.Int
+		bytes, err = erc20.CallRaw(callOpts, erc20ABI.PackBalanceOf(erc20PaymasterAddress))
+		require.NoError(t, err)
+		erc20PaymasterBalance, err = erc20ABI.UnpackBalanceOf(bytes)
+		require.NoError(t, err)
+		require.True(t, erc20PaymasterBalance.Sign() == 0)
+
+		txOpts := backend.GetEoas(t, 2)[1]
+		require.NotEqual(t, eoa.From, txOpts.From)
+		var (
+			// paymaster 의 deposit amount 는 줄어든다.
+			beforePaymasterDeposit, afterPaymasterDeposit binding.IStakeManagerDepositInfo
+			// eoa 는 erc20 토큰을 지불한다.
+			beforeErc20Balance, afterErc20Balance *big.Int
+			// eoa 는 native token 으로 gas fee 를 지불하지 않는다.
+			beforeTxOptsBalance, afterTxOptsBalance *big.Int
+
+			// tx 는 실행되었다.
+			beforeNumber, afterNumber *big.Int
+		)
+		beforeTxOptsBalance, err = backend.Client().PendingBalanceAt(ctx, txOpts.From)
+		require.NoError(t, err)
+
+		bytes, err = entryPoint.CallRaw(callOpts, entryPointABI.PackGetDepositInfo(erc20PaymasterAddress))
+		require.NoError(t, err)
+		beforePaymasterDeposit, err = entryPointABI.UnpackGetDepositInfo(bytes)
+		require.NoError(t, err)
+
+		bytes, err = erc20.CallRaw(callOpts, erc20ABI.PackBalanceOf(eoa.From))
+		require.NoError(t, err)
+		beforeErc20Balance, err = erc20ABI.UnpackBalanceOf(bytes)
+		require.NoError(t, err)
+
+		bytes, err = counter.CallRaw(callOpts, counterABI.PackNumber())
+		require.NoError(t, err)
+		beforeNumber, err = counterABI.UnpackNumber(bytes)
+		require.NoError(t, err)
+
+		// 트랜잭션은 eoa 가 아닌 계정으로 실행
+		// 트랜잭션에서 erc20Paymaster 에 예치된 eth 는 txOpts에게 지급된다.?
+		tx, err = entryPoint.RawTransact(txOpts, entryPointABI.PackHandleOps([]binding.PackedUserOperation{userOp}, txOpts.From))
+		require.NoError(t, err)
+		backend.Commit()
+		receipt, err = backend.Client().TransactionReceipt(ctx, tx.Hash())
+		require.NoError(t, err)
+		require.Equal(t, types.ReceiptStatusSuccessful, receipt.Status)
+		// Counter 의 Caller 는 eoa 이다.
+		func() {
+			for _, log := range receipt.Logs {
+				if event, err := counterABI.UnpackCallerEvent(log); err == nil {
+					require.Equal(t, eoa.From, event.Caller)
+					return
+				}
+			}
+			require.NoError(t, errors.New("no event found"))
+		}()
+
+		afterTxOptsBalance, err = backend.Client().PendingBalanceAt(ctx, txOpts.From)
+		require.NoError(t, err)
+
+		bytes, err = entryPoint.CallRaw(callOpts, entryPointABI.PackGetDepositInfo(erc20PaymasterAddress))
+		require.NoError(t, err)
+		afterPaymasterDeposit, err = entryPointABI.UnpackGetDepositInfo(bytes)
+		require.NoError(t, err)
+
+		bytes, err = erc20.CallRaw(callOpts, erc20ABI.PackBalanceOf(eoa.From))
+		require.NoError(t, err)
+		afterErc20Balance, err = erc20ABI.UnpackBalanceOf(bytes)
+		require.NoError(t, err)
+
+		bytes, err = counter.CallRaw(callOpts, counterABI.PackNumber())
+		require.NoError(t, err)
+		afterNumber, err = counterABI.UnpackNumber(bytes)
+		require.NoError(t, err)
+
+		// tx 는 실행되었다.
+		require.Equal(t, new(big.Int).Add(beforeNumber, common.Big1), afterNumber)
+		// paymaster 의 deposit amount 는 줄어든다.
+		require.True(t, afterPaymasterDeposit.Deposit.Cmp(beforePaymasterDeposit.Deposit) < 0)
+		// eoa 는 erc20 토큰을 지불한다.
+		require.True(t, afterErc20Balance.Cmp(beforeErc20Balance) < 0)
+		// eoa 가 지불한 가스비(erc20)은 erc20Paymaster 으로 이동된다.
+		bytes, err = erc20.CallRaw(callOpts, erc20ABI.PackBalanceOf(erc20PaymasterAddress))
+		require.NoError(t, err)
+		erc20PaymasterBalance, err = erc20ABI.UnpackBalanceOf(bytes)
+		require.NoError(t, err)
+		require.Equal(t, new(big.Int).Sub(beforeErc20Balance, afterErc20Balance), erc20PaymasterBalance)
+
+		subBalance := new(big.Int).Sub(beforeTxOptsBalance, afterTxOptsBalance)
+		subDeposit := new(big.Int).Sub(beforePaymasterDeposit.Deposit, afterPaymasterDeposit.Deposit)
+		spendGas := new(big.Int).Add(subBalance, subDeposit)
+		usedGas := new(big.Int).Mul(receipt.EffectiveGasPrice, new(big.Int).SetUint64(receipt.GasUsed))
+		require.Equal(t, spendGas, usedGas)
+	})
 }
